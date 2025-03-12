@@ -5,6 +5,13 @@ import { createClient } from "@supabase/supabase-js";
 const rawSupabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
 const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 
+console.log(
+  "Supabase initialization - URL type:",
+  typeof rawSupabaseUrl,
+  "key present:",
+  !!supabaseKey
+);
+
 // Extract the Supabase reference ID from the JWT if it's in that format
 let supabaseUrl = rawSupabaseUrl;
 try {
@@ -23,6 +30,9 @@ try {
   // Fallback to a placeholder for development
   supabaseUrl = "https://placeholder-for-dev.supabase.co";
 }
+
+// Explicit logging to debug connection issues
+console.log("Using Supabase URL:", supabaseUrl);
 
 // Initialize the Supabase client with explicit auth configuration
 export const supabase = createClient(supabaseUrl, supabaseKey, {

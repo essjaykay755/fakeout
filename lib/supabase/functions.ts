@@ -27,6 +27,31 @@ export async function getGameSession(userId: string) {
   console.log(`Getting game session for user: ${userId}`);
 
   try {
+    // Check if Supabase is properly initialized
+    if (!supabase) {
+      console.error("Supabase client is not initialized");
+      throw new Error("Database client not available");
+    }
+
+    // Test the Supabase connection with a simple query
+    try {
+      const { count, error: testError } = await supabase
+        .from("news_articles")
+        .select("*", { count: "exact", head: true });
+
+      if (testError) {
+        console.error("Supabase connection test failed:", testError);
+        throw new Error(
+          `Database connection failed: ${JSON.stringify(testError)}`
+        );
+      }
+
+      console.log("Supabase connection test passed");
+    } catch (testErr) {
+      console.error("Exception during Supabase connection test:", testErr);
+      throw new Error(`Database connection test exception: ${testErr}`);
+    }
+
     // First check if there are any articles in the database
     const { count: totalCount, error: countError } = await supabase
       .from("news_articles")
@@ -84,10 +109,52 @@ export async function getGameSession(userId: string) {
     const seenArticles = userData?.seen_articles || [];
     console.log(`User has seen ${seenArticles.length} articles:`, seenArticles);
 
-    // Check if the user has seen all articles
+    // Log all available article IDs for debugging
+    const { data: allArticleData, error: allArticleError } = await supabase
+      .from("news_articles")
+      .select("article_id");
+
+    if (allArticleError) {
+      console.error("Error fetching all article IDs:", allArticleError);
+    } else {
+      console.log(
+        "All article IDs:",
+        allArticleData?.map((a) => a.article_id)
+      );
+    }
+
+    // Check if the user has seen all articles with better validation
+    let hasSeenAllArticles = false;
+    if (
+      seenArticles &&
+      seenArticles.length > 0 &&
+      allArticleData &&
+      allArticleData.length > 0
+    ) {
+      // Only consider valid article IDs
+      const validSeenArticles = seenArticles.filter(
+        (id: string) =>
+          typeof id === "string" &&
+          id.trim() !== "" &&
+          allArticleData.some((a) => a.article_id === id)
+      );
+
+      if (validSeenArticles.length > 0) {
+        hasSeenAllArticles = validSeenArticles.length >= allArticleData.length;
+        console.log(
+          `Valid seen articles: ${validSeenArticles.length}, Total articles: ${allArticleData.length}`
+        );
+        console.log(`Has seen all articles: ${hasSeenAllArticles}`);
+      } else {
+        console.log(
+          "No valid seen articles found, assuming user has not seen all articles"
+        );
+      }
+    }
+
     // For small article databases, we want to avoid resetting too quickly
     // Only reset when they've seen ALL articles AND there are more than just a few
-    if (seenArticles.length >= totalCount && totalCount > 3) {
+    if (hasSeenAllArticles && totalCount > 3) {
       console.log(
         "User has seen all available articles. Resetting seen articles list."
       );
@@ -103,7 +170,7 @@ export async function getGameSession(userId: string) {
         console.log("Successfully reset user's seen articles");
         seenArticles.length = 0; // Clear the local array too
       }
-    } else if (seenArticles.length >= totalCount) {
+    } else if (hasSeenAllArticles) {
       // If there are only a few articles, we need to handle this case differently
       console.log(
         "User has seen all available articles but we have limited articles. Not resetting."
@@ -126,11 +193,11 @@ export async function getGameSession(userId: string) {
     // Fetch random articles from the database that haven't been seen by this user
     let query = supabase.from("news_articles").select("*");
 
-    // Filter out articles the user has already seen
+    // Filter out articles the user has already seen - improved filtering logic
     if (seenArticles.length > 0) {
       // Making sure we're using a properly formatted array for the filter
       const formattedSeenArticles = seenArticles.filter(
-        (id: string) => id && typeof id === "string"
+        (id: string) => id && typeof id === "string" && id.trim() !== ""
       );
       console.log(
         `Formatted seen articles for filtering: ${JSON.stringify(
@@ -139,7 +206,11 @@ export async function getGameSession(userId: string) {
       );
 
       if (formattedSeenArticles.length > 0) {
-        query = query.not("article_id", "in", formattedSeenArticles);
+        query = query.not(
+          "article_id",
+          "in",
+          `(${formattedSeenArticles.join(",")})`
+        );
         console.log("Applied filter to exclude seen articles");
       } else {
         console.log(
@@ -150,11 +221,84 @@ export async function getGameSession(userId: string) {
       console.log("No articles to filter out, fetching any available articles");
     }
 
+    // Make sure we fetch both real and fake news
     // Add randomization to avoid showing articles in the same order
-    // Use raw SQL for random ordering
-    const { data: randomArticles, error } = await query
-      .order("article_id", { ascending: false })
-      .limit(10);
+    // Debug: Log the query before execution
+    console.log("Looking for articles with query:", query);
+
+    // First, count how many real and fake articles would be returned
+    const { count: realCount, error: realCountError } = await supabase
+      .from("news_articles")
+      .select("*", { count: "exact", head: true })
+      .eq("is_real", true);
+
+    const { count: fakeCount, error: fakeCountError } = await supabase
+      .from("news_articles")
+      .select("*", { count: "exact", head: true })
+      .eq("is_real", false);
+
+    console.log(
+      `Potential real articles: ${realCount}, Potential fake articles: ${fakeCount}`
+    );
+
+    // Fetch BOTH real and fake news separately to ensure we get both types
+    let randomArticles: any[] = [];
+    let error = null;
+
+    // Fetch real news
+    if (realCount && realCount > 0) {
+      const { data: realArticles, error: realError } = await query
+        .eq("is_real", true)
+        .order("article_id", { ascending: false })
+        .limit(5);
+
+      if (realError) {
+        console.error("Error fetching real articles:", realError);
+        error = realError;
+      } else if (realArticles) {
+        randomArticles = [...randomArticles, ...realArticles];
+        console.log(`Retrieved ${realArticles.length} real news articles`);
+      }
+    }
+
+    // Fetch fake news
+    if (fakeCount && fakeCount > 0) {
+      const { data: fakeArticles, error: fakeError } = await query
+        .eq("is_real", false)
+        .order("article_id", { ascending: false })
+        .limit(5);
+
+      if (fakeError) {
+        console.error("Error fetching fake articles:", fakeError);
+        if (!error) error = fakeError;
+      } else if (fakeArticles) {
+        randomArticles = [...randomArticles, ...fakeArticles];
+        console.log(`Retrieved ${fakeArticles.length} fake news articles`);
+      }
+    }
+
+    // If we couldn't fetch either type separately, try the original approach
+    if (randomArticles.length === 0) {
+      console.log("Falling back to combined article query");
+      const { data: allArticles, error: queryError } = await query
+        .order("article_id", { ascending: false })
+        .limit(10);
+
+      if (queryError) {
+        error = queryError;
+      } else if (allArticles) {
+        randomArticles = allArticles;
+      }
+    }
+
+    // Debug: Log what type of articles we got
+    if (randomArticles && randomArticles.length > 0) {
+      const realNewsCount = randomArticles.filter((a) => a.is_real).length;
+      const fakeNewsCount = randomArticles.filter((a) => !a.is_real).length;
+      console.log(
+        `Retrieved ${realNewsCount} real news and ${fakeNewsCount} fake news articles`
+      );
+    }
 
     if (error) {
       console.error("Error fetching articles:", error);
@@ -259,13 +403,15 @@ export async function getGameSession(userId: string) {
     };
   } catch (error) {
     console.error("Error in getGameSession:", error);
-    // Only use mock articles as a last resort
+    // Only return error information, no mock articles
     return {
-      id: "mock-session-id",
+      id: "error-session",
       user_id: userId,
-      articles: getMockArticles(5, true), // Set fixed=true to easily identify mock articles
+      articles: [],
       score: 0,
       answers: {},
+      message:
+        "Could not retrieve articles from the database. Please try again later.",
     };
   }
 }
@@ -329,8 +475,50 @@ export async function createGameSession(userId: string) {
     const seenArticles = userData?.seen_articles || [];
     console.log(`User has seen ${seenArticles.length} articles:`, seenArticles);
 
-    // Check if the user has seen all articles
-    if (seenArticles.length >= totalCount) {
+    // First get all articles for debugging
+    const { data: allArticles } = await supabase
+      .from("news_articles")
+      .select("article_id");
+    console.log(
+      "All article IDs in database:",
+      allArticles?.map((a) => a.article_id)
+    );
+
+    // Check if the user has seen all articles - only if seenArticles actually contains valid IDs
+    let hasSeenAllArticles = false;
+    if (
+      seenArticles &&
+      seenArticles.length > 0 &&
+      allArticles &&
+      allArticles.length > 0
+    ) {
+      // Only consider valid article IDs
+      const validSeenArticles = seenArticles.filter(
+        (id: string) =>
+          typeof id === "string" &&
+          id.trim() !== "" &&
+          allArticles.some((a) => a.article_id === id)
+      );
+
+      // Only consider it "all seen" if there are actually valid seen articles
+      if (validSeenArticles.length > 0) {
+        hasSeenAllArticles = validSeenArticles.length >= allArticles.length;
+        console.log(
+          `Valid seen articles: ${validSeenArticles.length}, Total articles: ${allArticles.length}`
+        );
+        console.log(`Has seen all articles: ${hasSeenAllArticles}`);
+      } else {
+        console.log(
+          "No valid seen articles found, assuming user has not seen all articles"
+        );
+      }
+    } else {
+      console.log(
+        "Either seen articles or all articles is empty, assuming user has not seen all articles"
+      );
+    }
+
+    if (hasSeenAllArticles) {
       console.log("User has seen all available articles.");
 
       // If there's only one article or just a few articles, we want to avoid resetting too quickly
@@ -378,7 +566,7 @@ export async function createGameSession(userId: string) {
     if (seenArticles.length > 0) {
       // Making sure we're using a properly formatted array for the filter
       const formattedSeenArticles = seenArticles.filter(
-        (id: string) => id && typeof id === "string"
+        (id: string) => id && typeof id === "string" && id.trim() !== ""
       );
       console.log(
         `Formatted seen articles for filtering: ${JSON.stringify(
@@ -387,7 +575,11 @@ export async function createGameSession(userId: string) {
       );
 
       if (formattedSeenArticles.length > 0) {
-        query = query.not("article_id", "in", formattedSeenArticles);
+        query = query.not(
+          "article_id",
+          "in",
+          `(${formattedSeenArticles.join(",")})`
+        );
         console.log("Applied filter to exclude seen articles");
       } else {
         console.log(
@@ -398,24 +590,88 @@ export async function createGameSession(userId: string) {
       console.log("No articles to filter out, fetching any available articles");
     }
 
-    // First, get all articles for debugging
-    const { data: allArticles } = await supabase
+    // Make sure we fetch both real and fake news
+    // Add randomization to avoid showing articles in the same order
+    // Debug: Log the query before execution
+    console.log("Looking for articles with query:", query);
+
+    // First, count how many real and fake articles would be returned
+    const { count: realCount, error: realCountError } = await supabase
       .from("news_articles")
-      .select("article_id");
+      .select("*", { count: "exact", head: true })
+      .eq("is_real", true);
+
+    const { count: fakeCount, error: fakeCountError } = await supabase
+      .from("news_articles")
+      .select("*", { count: "exact", head: true })
+      .eq("is_real", false);
+
     console.log(
-      "All article IDs in database:",
-      allArticles?.map((a) => a.article_id)
+      `Potential real articles: ${realCount}, Potential fake articles: ${fakeCount}`
     );
 
-    // Add randomization to avoid showing articles in the same order
-    // Use regular ordering since true randomization is hard with Supabase
-    const { data: randomArticles, error } = await query
-      .order("article_id", { ascending: false })
-      .limit(10);
+    // Fetch BOTH real and fake news separately to ensure we get both types
+    let randomArticles: any[] = [];
+    let error = null;
+
+    // Fetch real news
+    if (realCount && realCount > 0) {
+      const { data: realArticles, error: realError } = await query
+        .eq("is_real", true)
+        .order("article_id", { ascending: false })
+        .limit(5);
+
+      if (realError) {
+        console.error("Error fetching real articles:", realError);
+        error = realError;
+      } else if (realArticles) {
+        randomArticles = [...randomArticles, ...realArticles];
+        console.log(`Retrieved ${realArticles.length} real news articles`);
+      }
+    }
+
+    // Fetch fake news
+    if (fakeCount && fakeCount > 0) {
+      const { data: fakeArticles, error: fakeError } = await query
+        .eq("is_real", false)
+        .order("article_id", { ascending: false })
+        .limit(5);
+
+      if (fakeError) {
+        console.error("Error fetching fake articles:", fakeError);
+        if (!error) error = fakeError;
+      } else if (fakeArticles) {
+        randomArticles = [...randomArticles, ...fakeArticles];
+        console.log(`Retrieved ${fakeArticles.length} fake news articles`);
+      }
+    }
+
+    // If we couldn't fetch either type separately, try the original approach
+    if (randomArticles.length === 0) {
+      console.log("Falling back to combined article query");
+      const { data: allArticles, error: queryError } = await query
+        .order("article_id", { ascending: false })
+        .limit(10);
+
+      if (queryError) {
+        error = queryError;
+      } else if (allArticles) {
+        randomArticles = allArticles;
+      }
+    }
+
+    // Debug: Log what type of articles we got
+    if (randomArticles && randomArticles.length > 0) {
+      const realNewsCount = randomArticles.filter((a) => a.is_real).length;
+      const fakeNewsCount = randomArticles.filter((a) => !a.is_real).length;
+      console.log(
+        `Retrieved ${realNewsCount} real news and ${fakeNewsCount} fake news articles`
+      );
+    }
 
     if (error) {
       console.error("Error fetching articles:", error);
-      throw new Error("Failed to fetch articles");
+      throw new Error(`Failed to fetch articles: ${JSON.stringify(error)}`);
     }
 
     if (!randomArticles || randomArticles.length === 0) {
@@ -455,12 +711,14 @@ export async function createGameSession(userId: string) {
     };
   } catch (error) {
     console.error("Error in createGameSession:", error);
-    // Only use mock articles as a last resort
+    // Only return error information, no mock articles
     return {
-      id: "mock-session-id",
+      id: "error-session",
       user_id: userId,
-      articles: getMockArticles(5, true), // Set fixed=true to easily identify mock articles
+      articles: [],
       score: 0,
+      message:
+        "Could not retrieve articles from the database. Please try again later.",
     };
   }
 }
@@ -761,6 +1019,47 @@ export async function generateMoreArticles(sessionId: string, userId: string) {
   console.log(`Generating more articles for session ${sessionId}`);
 
   try {
+    // Verify Supabase client is initialized
+    if (!supabase) {
+      console.error("Supabase client is not initialized");
+      return {
+        success: false,
+        error: "Database connection not available",
+        articles: [],
+      };
+    }
+
+    // Test connection with a simple query first
+    try {
+      const { data: testData, error: testError } = await supabase
+        .from("news_articles")
+        .select("article_id")
+        .limit(1);
+
+      if (testError) {
+        console.error("Database connection test failed:", testError);
+        return {
+          success: false,
+          error: `Database connection test failed: ${JSON.stringify(
+            testError
+          )}`,
+          articles: [],
+        };
+      }
+
+      console.log("Database connection test successful");
+    } catch (connectionErr) {
+      console.error(
+        "Exception during database connection test:",
+        connectionErr
+      );
+      return {
+        success: false,
+        error: `Database connection exception: ${connectionErr}`,
+        articles: [],
+      };
+    }
+
     // First check if there are any articles in the database
     const { count: totalCount, error: countError } = await supabase
       .from("news_articles")
@@ -768,14 +1067,23 @@ export async function generateMoreArticles(sessionId: string, userId: string) {
 
     if (countError) {
       console.error("Error checking article count:", countError);
-      throw new Error("Could not check article count");
+      return {
+        success: false,
+        error: `Could not check article count: ${JSON.stringify(countError)}`,
+        articles: [],
+      };
     }
 
     if (!totalCount || totalCount === 0) {
       console.error(
         "No articles found in the database. Please add articles in the admin panel."
       );
-      throw new Error("No articles in database");
+      return {
+        success: false,
+        error:
+          "No articles in database. Please contact an administrator to add content.",
+        articles: [],
+      };
     }
 
     console.log(`Total articles in database: ${totalCount}`);
@@ -789,22 +1097,73 @@ export async function generateMoreArticles(sessionId: string, userId: string) {
 
     if (userError && userError.code !== "PGRST116") {
       console.error("Error fetching user data:", userError);
+      // Continue with empty seen articles list instead of failing
+      console.log("Will proceed with empty seen articles list");
     }
 
     const seenArticles = userData?.seen_articles || [];
-    console.log(`User has seen ${seenArticles.length} articles`);
+    console.log(`User has seen ${seenArticles.length} articles:`, seenArticles);
 
-    // Check if the user has seen all articles
-    if (seenArticles.length >= totalCount) {
+    // Log all article IDs for debugging
+    try {
+      const { data: allArticles } = await supabase
+        .from("news_articles")
+        .select("article_id");
       console.log(
-        "User has seen all available articles. Resetting seen articles list."
+        "All article IDs in database:",
+        allArticles?.map((a) => a.article_id)
       );
-      // Reset seen articles to empty to allow user to see articles again
-      await supabase
-        .from("users")
-        .update({ seen_articles: [] })
-        .eq("id", userId);
-      seenArticles.length = 0;
+
+      // Check if the user has seen all articles with better validation
+      let hasSeenAllArticles = false;
+      if (
+        seenArticles &&
+        seenArticles.length > 0 &&
+        allArticles &&
+        allArticles.length > 0
+      ) {
+        // Only consider valid article IDs
+        const validSeenArticles = seenArticles.filter(
+          (id: string) =>
+            typeof id === "string" &&
+            id.trim() !== "" &&
+            allArticles.some((a) => a.article_id === id)
+        );
+
+        if (validSeenArticles.length > 0) {
+          hasSeenAllArticles = validSeenArticles.length >= allArticles.length;
+          console.log(
+            `Valid seen articles: ${validSeenArticles.length}, Total articles: ${allArticles.length}`
+          );
+          console.log(`Has seen all articles: ${hasSeenAllArticles}`);
+        } else {
+          console.log(
+            "No valid seen articles found, assuming user has not seen all articles"
+          );
+        }
+      }
+
+      // Check if the user has seen all articles
+      if (hasSeenAllArticles) {
+        console.log(
+          "User has seen all available articles. Resetting seen articles list."
+        );
+        // Reset seen articles to empty to allow user to see articles again
+        const { error: resetError } = await supabase
+          .from("users")
+          .update({ seen_articles: [] })
+          .eq("id", userId);
+
+        if (resetError) {
+          console.error("Error resetting seen articles:", resetError);
+          // Continue anyway but log the error
+        } else {
+          console.log("Successfully reset user's seen articles");
+        }
+        seenArticles.length = 0;
+      }
+    } catch (debugErr) {
+      console.error("Error fetching all article IDs:", debugErr);
     }
 
     // Fetch more articles from the database that haven't been seen by this user
@@ -813,31 +1172,129 @@ export async function generateMoreArticles(sessionId: string, userId: string) {
     // Filter out articles the user has already seen
     if (seenArticles.length > 0) {
       // Fixed: Handle the query correctly for any number of seen articles
-      query = query.not("article_id", "in", seenArticles);
+      // Making sure we're using a properly formatted array for the filter
+      const formattedSeenArticles = seenArticles.filter(
+        (id: string) => id && typeof id === "string" && id.trim() !== ""
+      );
+
+      if (formattedSeenArticles.length > 0) {
+        query = query.not(
+          "article_id",
+          "in",
+          `(${formattedSeenArticles.join(",")})`
+        );
+        console.log(
+          `Filtering out seen articles: ${JSON.stringify(
+            formattedSeenArticles
+          )}`
+        );
+      } else {
+        console.log("No valid article IDs to filter - fetching all articles");
+      }
+    } else {
+      console.log("No articles to filter - fetching all articles");
     }
 
+    // Make sure we fetch both real and fake news
     // Add randomization to avoid showing articles in the same order
-    // Use regular ordering since true randomization is hard with Supabase
-    const { data: moreArticles, error } = await query
-      .order("article_id", { ascending: false })
-      .limit(5);
+    // Debug: Log the query before execution
+    console.log("Looking for articles with query:", query);
+
+    // First, count how many real and fake articles would be returned
+    const { count: realCount, error: realCountError } = await supabase
+      .from("news_articles")
+      .select("*", { count: "exact", head: true })
+      .eq("is_real", true);
+
+    const { count: fakeCount, error: fakeCountError } = await supabase
+      .from("news_articles")
+      .select("*", { count: "exact", head: true })
+      .eq("is_real", false);
+
+    console.log(
+      `Potential real articles: ${realCount}, Potential fake articles: ${fakeCount}`
+    );
+
+    // Fetch BOTH real and fake news separately to ensure we get both types
+    let randomArticles: any[] = [];
+    let error = null;
+
+    // Fetch real news
+    if (realCount && realCount > 0) {
+      const { data: realArticles, error: realError } = await query
+        .eq("is_real", true)
+        .order("article_id", { ascending: false })
+        .limit(5);
+
+      if (realError) {
+        console.error("Error fetching real articles:", realError);
+        error = realError;
+      } else if (realArticles) {
+        randomArticles = [...randomArticles, ...realArticles];
+        console.log(`Retrieved ${realArticles.length} real news articles`);
+      }
+    }
+
+    // Fetch fake news
+    if (fakeCount && fakeCount > 0) {
+      const { data: fakeArticles, error: fakeError } = await query
+        .eq("is_real", false)
+        .order("article_id", { ascending: false })
+        .limit(5);
+
+      if (fakeError) {
+        console.error("Error fetching fake articles:", fakeError);
+        if (!error) error = fakeError;
+      } else if (fakeArticles) {
+        randomArticles = [...randomArticles, ...fakeArticles];
+        console.log(`Retrieved ${fakeArticles.length} fake news articles`);
+      }
+    }
+
+    // If we couldn't fetch either type separately, try the original approach
+    if (randomArticles.length === 0) {
+      console.log("Falling back to combined article query");
+      const { data: allArticles, error: queryError } = await query
+        .order("article_id", { ascending: false })
+        .limit(10);
+
+      if (queryError) {
+        error = queryError;
+      } else if (allArticles) {
+        randomArticles = allArticles;
+      }
+    }
+
+    // Debug: Log what type of articles we got
+    if (randomArticles && randomArticles.length > 0) {
+      const realNewsCount = randomArticles.filter((a) => a.is_real).length;
+      const fakeNewsCount = randomArticles.filter((a) => !a.is_real).length;
+      console.log(
+        `Retrieved ${realNewsCount} real news and ${fakeNewsCount} fake news articles`
+      );
+    }
 
     if (error) {
-      console.error("Error fetching more articles:", error);
-      throw new Error("Failed to fetch articles");
+      console.error("Error fetching articles:", error);
+      throw new Error(`Failed to fetch articles: ${JSON.stringify(error)}`);
     }
 
-    if (!moreArticles || moreArticles.length === 0) {
+    if (!randomArticles || randomArticles.length === 0) {
       console.error("No more unseen articles found for the user");
-      throw new Error("No unseen articles");
+      return {
+        success: false,
+        error: "No unseen articles available",
+        articles: [],
+      };
     }
 
     console.log(
-      `Found ${moreArticles.length} more unseen articles for the user`
+      `Found ${randomArticles.length} more unseen articles for the user:`,
+      randomArticles.map((a) => a.article_id)
     );
 
     // Convert database articles to ArticleType
-    const articles = moreArticles.map((article) => ({
+    const articles = randomArticles.map((article) => ({
       id: article.article_id,
       title: (article.title || "Untitled Article").replace(/^Fake:\s+/i, ""),
       content: article.content || "",
@@ -859,10 +1316,10 @@ export async function generateMoreArticles(sessionId: string, userId: string) {
     };
   } catch (error) {
     console.error("Error in generateMoreArticles:", error);
-    // Only use mock articles as a last resort
     return {
-      success: true,
-      articles: getMockArticles(3, true), // Set fixed=true to easily identify mock articles
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      articles: [],
     };
   }
 }
@@ -870,106 +1327,99 @@ export async function generateMoreArticles(sessionId: string, userId: string) {
 // Helper function to generate mock articles (used as fallback)
 function getMockArticles(count = 5, fixed = false): ArticleType[] {
   console.warn(
-    "Falling back to mock articles. This should only happen if there are no articles in the database."
+    "Not returning mock articles as per user preference. Please ensure database has articles."
   );
 
-  // Define fixed mock articles for easier identification
-  const mockArticles = [
-    {
-      id: "mock-article-1",
-      title: "[MOCK] Shocking Study Reveals Unexpected Health Risk",
-      content:
-        "<p>This is a mock article used when no real articles are available in the database. Please add articles in the admin panel.</p><p>A recent study has made alarming claims about everyday products. However, the methodology is questionable and the conclusions are not supported by mainstream science.</p>",
-      author: "Mock Author",
-      publisher: "Mock News",
-      url: "https://example.com/mock-news",
-      is_fake: true,
-      category: "Health Misinformation",
-      published_at: new Date().toISOString(),
-    },
-    {
-      id: "mock-article-2",
-      title: "[MOCK] New Research Highlights Benefits of Regular Exercise",
-      content:
-        "<p>This is a mock article used when no real articles are available in the database. Please add articles in the admin panel.</p><p>According to a peer-reviewed study published in a reputable journal, regular exercise continues to show significant health benefits across all age groups.</p>",
-      author: "Dr. Mock Smith",
-      publisher: "Mock Science Journal",
-      url: "https://example.com/mock-science",
-      is_fake: false,
-      category: "Health",
-      published_at: new Date().toISOString(),
-    },
-    {
-      id: "mock-article-3",
-      title: "[MOCK] Revolutionary Technology Claims to Solve Energy Crisis",
-      content:
-        "<p>This is a mock article used when no real articles are available in the database. Please add articles in the admin panel.</p><p>A startup company claims to have developed a revolutionary technology that produces unlimited clean energy, but experts remain skeptical about the lack of peer-reviewed evidence.</p>",
-      author: "Mock Reporter",
-      publisher: "Mock Tech News",
-      url: "https://example.com/mock-tech",
-      is_fake: true,
-      category: "Technology",
-      published_at: new Date().toISOString(),
-    },
-    {
-      id: "mock-article-4",
-      title: "[MOCK] Government Announces New Climate Agreement",
-      content:
-        "<p>This is a mock article used when no real articles are available in the database. Please add articles in the admin panel.</p><p>World leaders have reached a historic agreement on climate change targets during the latest international summit, according to official reports released yesterday.</p>",
-      author: "Political Mock",
-      publisher: "Mock World News",
-      url: "https://example.com/mock-politics",
-      is_fake: false,
-      category: "Politics",
-      published_at: new Date().toISOString(),
-    },
-    {
-      id: "mock-article-5",
-      title: "[MOCK] Scientists Discover Ancient Civilization Beneath Ocean",
-      content:
-        "<p>This is a mock article used when no real articles are available in the database. Please add articles in the admin panel.</p><p>Researchers claim to have found evidence of an advanced ancient civilization beneath the Pacific Ocean, but other archaeologists have questioned the validity of the findings.</p>",
-      author: "Mock Archaeologist",
-      publisher: "Mock Discovery",
-      url: "https://example.com/mock-discovery",
-      is_fake: true,
-      category: "Science",
-      published_at: new Date().toISOString(),
-    },
-  ];
+  // Return empty array instead of mock articles
+  return [];
+}
 
-  if (fixed) {
-    // Return a subset of the fixed mock articles
-    return mockArticles.slice(0, Math.min(count, mockArticles.length));
+// Add this helper function to reset all seen articles
+export async function resetAllArticles(userId: string) {
+  console.log(`Resetting all seen articles for user: ${userId}`);
+
+  try {
+    // First verify the user exists
+    const { data: userData, error: userError } = await supabase
+      .from("users")
+      .select("id, seen_articles")
+      .eq("id", userId)
+      .single();
+
+    if (userError) {
+      console.error("Error finding user for reset:", userError);
+      if (userError.code === "PGRST116") {
+        // User not found, create a new user record with empty seen_articles
+        const { error: createError } = await supabase.from("users").insert({
+          id: userId,
+          username: "Player",
+          email: "player@example.com",
+          points: 0,
+          seen_articles: [],
+        });
+
+        if (createError) {
+          console.error("Error creating user record:", createError);
+          return { success: false, error: "Failed to create user record" };
+        }
+
+        console.log("Created new user with empty seen_articles");
+        return {
+          success: true,
+          message: "Created new user with empty seen articles",
+        };
+      }
+
+      return {
+        success: false,
+        error: `User lookup failed: ${userError.message}`,
+      };
+    }
+
+    // Reset seen articles to empty to allow user to see articles again
+    const { error: updateError } = await supabase
+      .from("users")
+      .update({ seen_articles: [] })
+      .eq("id", userId);
+
+    if (updateError) {
+      console.error("Error resetting seen articles:", updateError);
+      return {
+        success: false,
+        error: `Failed to reset: ${updateError.message}`,
+      };
+    }
+
+    // Verify the reset worked by checking the user record again
+    const { data: verifyData, error: verifyError } = await supabase
+      .from("users")
+      .select("seen_articles")
+      .eq("id", userId)
+      .single();
+
+    if (verifyError) {
+      console.error("Error verifying reset:", verifyError);
+      return {
+        success: true,
+        warning: "Reset command sent but verification failed",
+      };
+    }
+
+    if (verifyData.seen_articles && verifyData.seen_articles.length > 0) {
+      console.warn(
+        "Reset may not have been complete:",
+        verifyData.seen_articles
+      );
+      return { success: true, warning: "Reset may be incomplete" };
+    }
+
+    console.log("Successfully reset user's seen articles");
+    return { success: true, message: "Successfully reset seen articles" };
+  } catch (error) {
+    console.error("Exception resetting user's seen articles:", error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    };
   }
-
-  // Generate dynamic mock articles (the original behavior)
-  const articles: ArticleType[] = [];
-
-  for (let i = 0; i < count; i++) {
-    const isFake = Math.random() > 0.5;
-
-    articles.push({
-      id: `article-${Date.now()}-${i}`,
-      title: `[MOCK] ${
-        isFake
-          ? "Shocking Study Reveals Unexpected Health Risk"
-          : "New Research Highlights Benefits of Regular Exercise"
-      }`,
-      content: `<p>This is a mock article. Please add real articles in the admin panel.</p>${
-        isFake
-          ? "<p>A recent study has made alarming claims about everyday products. However, the methodology is questionable and the conclusions are not supported by mainstream science.</p>"
-          : "<p>According to a peer-reviewed study published in a reputable journal, regular exercise continues to show significant health benefits across all age groups.</p>"
-      }`,
-      author: isFake ? "Mock Author" : "Dr. Mock Smith",
-      publisher: isFake ? "Mock News Online" : "Mock Science Journal",
-      url: isFake
-        ? "https://example.com/mock-fake-news"
-        : "https://example.com/mock-real-news",
-      is_fake: isFake,
-      category: isFake ? "Health Misinformation" : "Health",
-      published_at: new Date().toISOString(),
-    });
-  }
-
-  return articles;
 }

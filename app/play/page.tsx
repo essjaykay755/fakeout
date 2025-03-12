@@ -36,6 +36,7 @@ import {
   generateMoreArticles,
   getGameSession,
   createGameSession,
+  resetAllArticles,
 } from "@/lib/supabase/functions";
 import {
   CheckCircle,
@@ -432,41 +433,176 @@ export default function PlayGame() {
     }
   };
 
-  // Check if we're using mock articles
-  const usingMockArticles =
-    articles.length > 0 &&
-    (articles[0].id === "mock-article-1" || articles[0].id.startsWith("mock-"));
+  // Add a function to reset seen articles
+  const resetSeenArticles = async () => {
+    if (!user) return;
+
+    setLoading(true);
+    try {
+      // Use the improved resetAllArticles function
+      const result = await resetAllArticles(user.id);
+
+      if (!result.success) {
+        console.error("Error resetting seen articles:", result.error);
+        toast({
+          title: "Error",
+          description:
+            result.error || "Could not reset seen articles. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      if (result.warning) {
+        console.warn("Warning during reset:", result.warning);
+      }
+
+      // Clear local tracking too
+      setLocalSeenArticles([]);
+      toast({
+        title: "Reset Complete",
+        description:
+          "Your seen articles list has been reset. Refreshing game...",
+      });
+
+      // Force refresh the application state
+      setGameOver(false);
+
+      // Create a new session with fresh articles
+      try {
+        const newSession = await createGameSession(user.id);
+
+        if (
+          newSession &&
+          newSession.articles &&
+          newSession.articles.length > 0
+        ) {
+          console.log(
+            "Successfully loaded new articles after reset:",
+            newSession.articles.length,
+            "articles loaded"
+          );
+
+          // Count real and fake news
+          const realCount = newSession.articles.filter(
+            (a) => !a.is_fake
+          ).length;
+          const fakeCount = newSession.articles.filter((a) => a.is_fake).length;
+          console.log(
+            `Loaded ${realCount} real and ${fakeCount} fake news articles`
+          );
+
+          setSessionId(newSession.id);
+          setArticles(newSession.articles);
+          setCurrentArticleIndex(0);
+          setUserAnswers({});
+        } else {
+          console.error("No articles returned after reset:", newSession);
+          toast({
+            title: "Warning",
+            description:
+              "Reset completed but no articles could be loaded. Try refreshing the page.",
+            variant: "destructive",
+          });
+        }
+      } catch (sessionError) {
+        console.error("Error creating new session after reset:", sessionError);
+        toast({
+          title: "Error",
+          description:
+            "Failed to load new articles after reset. Please refresh the page.",
+          variant: "destructive",
+        });
+      }
+    } catch (err) {
+      console.error("Error in resetSeenArticles:", err);
+      toast({
+        title: "Error",
+        description: "An unexpected error occurred while resetting your game.",
+        variant: "destructive",
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleMoreArticles = async () => {
     if (!user || !sessionId) return;
 
     setLoading(true);
     try {
+      console.log("Attempting to fetch more articles for user:", user.id);
+      console.log("Current session ID:", sessionId);
+
+      // Debug current seen articles before fetching more
+      try {
+        const { data: userData } = await supabase
+          .from("users")
+          .select("seen_articles")
+          .eq("id", user.id)
+          .single();
+
+        console.log(
+          "User's seen articles before fetch:",
+          userData?.seen_articles || []
+        );
+      } catch (debugErr) {
+        console.error("Error checking seen articles:", debugErr);
+      }
+
       const result = await generateMoreArticles(sessionId, user.id);
 
-      if (result.articles && result.articles.length > 0) {
+      console.log("Result from generateMoreArticles:", result);
+
+      if (result && result.articles && result.articles.length > 0) {
         setArticles((prev) => [...prev, ...result.articles]);
         setGameOver(false);
         toast({
           title: "New Articles",
-          description: "More articles loaded successfully!",
+          description: `Loaded ${result.articles.length} more articles successfully!`,
         });
-      } else {
+      } else if (result && result.success === false) {
+        // Handle explicit failure case
         toast({
           title: "No Articles",
           description:
-            "No more articles available at the moment. Please try again later.",
+            result.error || "No more articles available at the moment.",
+          variant: "destructive",
+        });
+      } else {
+        // Handle empty result
+        toast({
+          title: "No Articles",
+          description:
+            "No more articles available at the moment. Please check back later.",
           variant: "destructive",
         });
       }
     } catch (error) {
       console.error("Error generating more articles:", error);
+
+      // More detailed error message to help debug
+      let errorMessage = "Could not load more articles.";
+      if (error instanceof Error) {
+        errorMessage += ` Error: ${error.message}`;
+        console.error("Stack trace:", error.stack);
+      }
+
       toast({
         title: "Error",
-        description: "Could not load more articles. Please try again.",
+        description: errorMessage,
         variant: "destructive",
       });
-    } finally {
+
+      // Don't provide mock articles, show error state
+      setArticles([]);
+      setGameOver(true);
+      toast({
+        title: "No Articles Available",
+        description:
+          "Could not retrieve articles from the database. Please check again later when administrators have added content.",
+        variant: "destructive",
+      });
       setLoading(false);
     }
   };
@@ -555,6 +691,20 @@ export default function PlayGame() {
     const fetchArticles = async () => {
       try {
         setLoading(true);
+
+        // Check if Supabase is initialized before trying to use it
+        if (!supabase) {
+          console.error("Supabase client is not initialized");
+          toast({
+            title: "Database Error",
+            description:
+              "Database connection is not available. Please refresh the page.",
+            variant: "destructive",
+          });
+          setLoading(false);
+          return;
+        }
+
         const gameSession = await getGameSession(user?.id || "anonymous");
 
         if (!gameSession) {
@@ -564,6 +714,7 @@ export default function PlayGame() {
             description: "Could not start game session",
             variant: "destructive",
           });
+          setLoading(false);
           return;
         }
 
@@ -641,9 +792,27 @@ export default function PlayGame() {
         setLoading(false);
       } catch (error) {
         console.error("Error fetching articles:", error);
+
+        // Check for specific error types to provide better user feedback
+        let errorMessage = "Failed to load articles";
+        if (error instanceof Error) {
+          errorMessage = error.message || errorMessage;
+          console.error("Error details:", error.stack);
+        }
+
         toast({
           title: "Error",
-          description: "Failed to load articles",
+          description: errorMessage,
+          variant: "destructive",
+        });
+
+        // Don't provide mock articles, show error state
+        setArticles([]);
+        setGameOver(true);
+        toast({
+          title: "No Articles Available",
+          description:
+            "Could not retrieve articles from the database. Please check again later when administrators have added content.",
           variant: "destructive",
         });
         setLoading(false);
@@ -743,144 +912,33 @@ export default function PlayGame() {
               </div>
             </div>
           ) : gameOver ? (
-            // Game over section
-            <div className="container max-w-4xl mx-auto p-6 flex-1 flex flex-col items-center justify-center">
-              {articles.length === 0 ? (
-                // No articles available
-                <div className="text-center py-12 px-4">
-                  <div className="bg-amber-100 rounded-full p-4 mx-auto w-16 h-16 flex items-center justify-center mb-4">
-                    <AlertTriangle className="h-8 w-8 text-amber-600" />
-                  </div>
-                  <h2 className="text-2xl font-bold text-gray-900 mb-2">
-                    No More Articles Available
-                  </h2>
-                  <p className="text-gray-600 mb-8 max-w-md mx-auto">
-                    You've seen all the available articles in our database.
-                    Please check back later for new content!
-                  </p>
+            <div className="flex flex-col items-center justify-center h-[60vh]">
+              <div className="w-full max-w-md mx-auto bg-white rounded-lg shadow-md overflow-hidden border border-gray-200 p-8">
+                <h2 className="text-2xl font-bold text-center mb-6 text-gray-800">
+                  No Articles Available
+                </h2>
+                <p className="text-gray-600 text-center mb-6">
+                  There are currently no more articles available to view.
+                  Articles are managed by administrators and will be added
+                  periodically. Please check back later.
+                </p>
+                <div className="flex flex-col gap-3 items-center">
                   <Button
-                    type="button"
                     onClick={restartGame}
+                    className="bg-blue-600 hover:bg-blue-700"
                     disabled={loading}
                   >
                     Check Again
                   </Button>
+                  <Button
+                    onClick={resetSeenArticles}
+                    variant="outline"
+                    disabled={loading}
+                  >
+                    Reset Seen Articles
+                  </Button>
                 </div>
-              ) : (
-                // Show stats and game summary
-                <>
-                  <div className="py-6">
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      <div className="bg-blue-50 rounded-lg p-4 text-center">
-                        <div className="text-3xl font-bold text-blue-600">
-                          {score}
-                        </div>
-                        <div className="text-sm text-gray-600 mt-1">
-                          Total Score
-                        </div>
-                      </div>
-                      <div className="bg-green-50 rounded-lg p-4 text-center">
-                        <div className="text-3xl font-bold text-green-600">
-                          {articleStats.correct}
-                        </div>
-                        <div className="text-sm text-gray-600 mt-1">
-                          Correct
-                        </div>
-                      </div>
-                      <div className="bg-red-50 rounded-lg p-4 text-center">
-                        <div className="text-3xl font-bold text-red-600">
-                          {articleStats.incorrect}
-                        </div>
-                        <div className="text-sm text-gray-600 mt-1">
-                          Incorrect
-                        </div>
-                      </div>
-                      <div className="bg-yellow-50 rounded-lg p-4 text-center">
-                        <div className="text-3xl font-bold text-yellow-600">
-                          {articleStats.bestStreak}
-                        </div>
-                        <div className="text-sm text-gray-600 mt-1">
-                          Best Streak
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-6 bg-gray-50 rounded-lg p-4">
-                      <h4 className="font-medium text-gray-900 mb-3">
-                        Your Media Literacy Rating
-                      </h4>
-                      <div className="relative pt-1">
-                        <div className="flex mb-2 items-center justify-between">
-                          <div>
-                            <span className="text-xs font-semibold inline-block py-1 px-2 uppercase rounded-full text-blue-600 bg-blue-200">
-                              Skill Level
-                            </span>
-                          </div>
-                          <div className="text-right">
-                            <span className="text-xs font-semibold inline-block text-blue-600">
-                              {articleStats.correct === 0
-                                ? 0
-                                : Math.round(
-                                    (articleStats.correct /
-                                      (articleStats.correct +
-                                        articleStats.incorrect)) *
-                                      100
-                                  )}
-                              %
-                            </span>
-                          </div>
-                        </div>
-                        <div className="overflow-hidden h-2 mb-4 text-xs flex rounded bg-blue-200">
-                          <div
-                            className="shadow-none flex flex-col text-center whitespace-nowrap text-white justify-center bg-blue-600"
-                            style={{
-                              width: `${
-                                articleStats.correct === 0
-                                  ? 0
-                                  : Math.round(
-                                      (articleStats.correct /
-                                        (articleStats.correct +
-                                          articleStats.incorrect)) *
-                                        100
-                                    )
-                              }%`,
-                            }}
-                          ></div>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-xs text-gray-500">
-                            Beginner
-                          </span>
-                          <span className="text-xs text-gray-500">
-                            Intermediate
-                          </span>
-                          <span className="text-xs text-gray-500">Expert</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-6 flex-1 flex items-center justify-center">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      className="flex-1 sm:flex-none"
-                      onClick={handleMoreArticles}
-                      disabled={loading}
-                    >
-                      Load More Articles
-                    </Button>
-                    <Button
-                      type="button"
-                      className="flex-1 sm:flex-none"
-                      onClick={restartGame}
-                      disabled={loading}
-                    >
-                      Start New Game
-                    </Button>
-                  </div>
-                </>
-              )}
+              </div>
             </div>
           ) : (
             // Main game area when playing
@@ -1369,7 +1427,7 @@ export default function PlayGame() {
         <div className="space-y-4">
           {/* Database Status Component */}
           <DatabaseStatus
-            usingMockArticles={usingMockArticles}
+            usingMockArticles={false}
             userId={user.id}
             onArticlesLoaded={handleArticlesLoaded}
           />
