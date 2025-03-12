@@ -26,6 +26,7 @@ export default function NewsManagement() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "real" | "fake">("all");
   const [editingArticle, setEditingArticle] = useState<Article | null>(null);
+  const [isCreatingArticle, setIsCreatingArticle] = useState(false);
   const [page, setPage] = useState(0);
   const pageSize = 10;
   const { toast } = useToast();
@@ -47,7 +48,7 @@ export default function NewsManagement() {
   const [imageUrl, setImageUrl] = useState("");
   const [isReal, setIsReal] = useState(false);
   const [reason, setReason] = useState("");
-  const [category, setCategory] = useState("");
+  const [category, setCategory] = useState("general");
 
   useEffect(() => {
     fetchArticles();
@@ -177,6 +178,7 @@ export default function NewsManagement() {
   }
 
   function handleEdit(article: Article) {
+    setIsCreatingArticle(false);
     setEditingArticle(article);
     setTitle(article.title);
     setContent(article.content);
@@ -184,6 +186,18 @@ export default function NewsManagement() {
     setIsReal(article.is_real);
     setReason(article.reason || "");
     setCategory(article.category);
+  }
+
+  function handleCreateNew() {
+    setEditingArticle(null);
+    setIsCreatingArticle(true);
+    // Set default values for new article
+    setTitle("");
+    setContent("");
+    setImageUrl("");
+    setIsReal(false);
+    setReason("");
+    setCategory("general");
   }
 
   // Handle single article deletion with improved error handling
@@ -272,6 +286,52 @@ export default function NewsManagement() {
   }
 
   async function handleSave() {
+    if (isCreatingArticle) {
+      // Creating a new article
+      try {
+        // Generate a unique ID for the new article
+        const newArticleId = crypto.randomUUID();
+
+        const { error } = await supabase.from("news_articles").insert({
+          article_id: newArticleId,
+          title,
+          content,
+          image_url: imageUrl || null,
+          is_real: isReal,
+          reason: isReal ? null : reason,
+          category,
+          created_at: new Date().toISOString(),
+          player_views: 0,
+        });
+
+        if (error) {
+          console.error("Error creating article:", error);
+          toast({
+            title: "Error",
+            description: "Failed to create article: " + error.message,
+            variant: "destructive",
+          });
+        } else {
+          setIsCreatingArticle(false);
+          toast({
+            title: "Success",
+            description: "Article created successfully",
+          });
+          fetchArticles();
+          fetchStats();
+        }
+      } catch (error) {
+        console.error("Error creating article:", error);
+        toast({
+          title: "Error",
+          description: "Failed to create article due to an unexpected error",
+          variant: "destructive",
+        });
+      }
+      return;
+    }
+
+    // Updating an existing article
     if (!editingArticle) return;
 
     try {
@@ -289,16 +349,27 @@ export default function NewsManagement() {
 
       if (error) {
         console.error("Error updating article:", error);
-        alert("Failed to update article");
+        toast({
+          title: "Error",
+          description: "Failed to update article: " + error.message,
+          variant: "destructive",
+        });
       } else {
         setEditingArticle(null);
         fetchArticles();
         fetchStats(); // Refresh stats after update
-        alert("Article updated successfully");
+        toast({
+          title: "Success",
+          description: "Article updated successfully",
+        });
       }
     } catch (error) {
       console.error("Error updating article:", error);
-      alert("Failed to update article");
+      toast({
+        title: "Error",
+        description: "Failed to update article due to an unexpected error",
+        variant: "destructive",
+      });
     }
   }
 
@@ -767,8 +838,16 @@ export default function NewsManagement() {
           </Button>
         </div>
 
-        {/* Add Export/Import buttons */}
+        {/* Add Export/Import/Create buttons */}
         <div className="flex space-x-2 ml-auto">
+          <Button
+            onClick={handleCreateNew}
+            className="bg-green-600 hover:bg-green-700 text-white"
+            disabled={loading}
+          >
+            Create New Article
+          </Button>
+
           <Button variant="outline" onClick={exportArticles} disabled={loading}>
             Export JSON
           </Button>
@@ -796,9 +875,11 @@ export default function NewsManagement() {
         <div className="text-center py-8">Loading articles...</div>
       ) : (
         <>
-          {editingArticle ? (
+          {editingArticle || isCreatingArticle ? (
             <Card className="p-4 mb-6">
-              <h3 className="text-xl font-medium mb-4">Edit Article</h3>
+              <h3 className="text-xl font-medium mb-4">
+                {isCreatingArticle ? "Create New Article" : "Edit Article"}
+              </h3>
 
               <div className="space-y-4">
                 <div>
@@ -808,6 +889,7 @@ export default function NewsManagement() {
                   <Input
                     value={title}
                     onChange={(e) => setTitle(e.target.value)}
+                    placeholder="Enter article title"
                   />
                 </div>
 
@@ -819,6 +901,7 @@ export default function NewsManagement() {
                     value={content}
                     onChange={(e) => setContent(e.target.value)}
                     className="w-full border rounded-md p-2 min-h-[150px]"
+                    placeholder="Enter article content (can include HTML tags)"
                   />
                 </div>
 
@@ -829,6 +912,7 @@ export default function NewsManagement() {
                   <Input
                     value={imageUrl}
                     onChange={(e) => setImageUrl(e.target.value)}
+                    placeholder="https://example.com/image.jpg (optional)"
                   />
                 </div>
 
@@ -839,6 +923,7 @@ export default function NewsManagement() {
                   <Input
                     value={category}
                     onChange={(e) => setCategory(e.target.value)}
+                    placeholder="e.g., politics, technology, health, etc."
                   />
                 </div>
 
@@ -860,15 +945,21 @@ export default function NewsManagement() {
                     <Input
                       value={reason}
                       onChange={(e) => setReason(e.target.value)}
+                      placeholder="Explain why this is fake news"
                     />
                   </div>
                 )}
 
                 <div className="flex space-x-4 mt-6">
-                  <Button onClick={handleSave}>Save Changes</Button>
+                  <Button onClick={handleSave}>
+                    {isCreatingArticle ? "Create Article" : "Save Changes"}
+                  </Button>
                   <Button
                     variant="outline"
-                    onClick={() => setEditingArticle(null)}
+                    onClick={() => {
+                      setEditingArticle(null);
+                      setIsCreatingArticle(false);
+                    }}
                   >
                     Cancel
                   </Button>

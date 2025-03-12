@@ -73,10 +73,18 @@ export default function PlayGame() {
   const [articles, setArticles] = useState<Article[]>([]);
   const [currentArticleIndex, setCurrentArticleIndex] = useState(0);
   const [userAnswers, setUserAnswers] = useState<Record<string, boolean>>({});
-  const [selectedReason, setSelectedReason] = useState<string>("");
+  const [selectedReason, setSelectedReason] = useState<string | undefined>(
+    undefined
+  );
   const [score, setScore] = useState(0);
-  const [feedbackData, setFeedbackData] = useState<FeedbackType | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [feedbackData, setFeedbackData] = useState<{
+    article_id: string;
+    is_fake: boolean;
+    reason?: string;
+    explanation?: string;
+    message: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(true);
   const [initialLoading, setInitialLoading] = useState(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [gameOver, setGameOver] = useState(false);
@@ -105,6 +113,9 @@ export default function PlayGame() {
     correct: 0,
     incorrect: 0,
   });
+
+  // Add local tracking for articles we've answered in this session
+  const [localSeenArticles, setLocalSeenArticles] = useState<string[]>([]);
 
   // Fake news categories with their descriptions for the UI
   const reasonOptions = [
@@ -321,13 +332,16 @@ export default function PlayGame() {
       newAnswers[currentArticle.id] = answer;
       setUserAnswers(newAnswers);
 
+      // Add to local tracking immediately
+      setLocalSeenArticles((prev) => [...prev, currentArticle.id]);
+
       // Submit answer to backend
       const result = await submitAnswer(
         sessionId,
         user?.id || "anonymous",
         currentArticle.id,
         answer,
-        selectedReason || undefined
+        selectedReason ? selectedReason : undefined
       );
 
       // Update feedback data with null check
@@ -465,22 +479,35 @@ export default function PlayGame() {
       // Create a new session
       const newSession = await createGameSession(user.id);
 
-      // Reset all game state
-      setSessionId(newSession.id);
-      setArticles(newSession.articles);
-      setCurrentArticleIndex(0);
-      setUserAnswers({});
-      setScore(0);
-      setFeedbackData(null);
-      setGameOver(false);
+      // Check if there's a message (which means all articles have been seen)
+      if (newSession.message) {
+        // Set an empty array of articles
+        setArticles([]);
+        setGameOver(true);
 
-      // Reset stats
-      updateStats(newSession.articles, {});
+        // Display the message to the user
+        toast({
+          title: "No New Articles",
+          description: newSession.message,
+        });
+      } else {
+        // Reset all game state
+        setSessionId(newSession.id);
+        setArticles(newSession.articles);
+        setCurrentArticleIndex(0);
+        setUserAnswers({});
+        setScore(0);
+        setFeedbackData(null);
+        setGameOver(false);
 
-      toast({
-        title: "New Game",
-        description: "Started a new game with fresh articles!",
-      });
+        // Reset stats
+        updateStats(newSession.articles, {});
+
+        toast({
+          title: "New Game",
+          description: "Started a new game with fresh articles!",
+        });
+      }
     } catch (error) {
       console.error("Error restarting game:", error);
       toast({
@@ -523,6 +550,110 @@ export default function PlayGame() {
       setGameOver(false);
     }
   };
+
+  useEffect(() => {
+    const fetchArticles = async () => {
+      try {
+        setLoading(true);
+        const gameSession = await getGameSession(user?.id || "anonymous");
+
+        if (!gameSession) {
+          console.error("Failed to get game session");
+          toast({
+            title: "Error",
+            description: "Could not start game session",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        // If we have a message, it means we've seen all articles
+        if (gameSession.message) {
+          toast({
+            title: "Notice",
+            description: gameSession.message,
+          });
+          setArticles([]);
+          setLoading(false);
+          setGameOver(true);
+          return;
+        }
+
+        // Filter out any articles that we've already locally tracked as seen
+        const filteredArticles = gameSession.articles.filter(
+          (article) => !localSeenArticles.includes(article.id)
+        );
+
+        console.log(
+          "Original articles from server:",
+          gameSession.articles.length
+        );
+        console.log("After local filtering:", filteredArticles.length);
+
+        if (filteredArticles.length === 0 && gameSession.articles.length > 0) {
+          // If all articles were filtered out but we had articles from the server,
+          // there might be a sync issue - force a new session
+          console.log(
+            "All articles filtered out locally, creating new session"
+          );
+          const newSession = await createGameSession(user?.id || "anonymous");
+
+          // Check if new session has a message (all articles seen)
+          if (newSession.message) {
+            toast({
+              title: "Notice",
+              description: newSession.message,
+            });
+            setArticles([]);
+            setLoading(false);
+            setGameOver(true);
+            return;
+          }
+
+          // Filter the new session's articles too
+          const newFilteredArticles = newSession.articles.filter(
+            (article) => !localSeenArticles.includes(article.id)
+          );
+
+          if (newFilteredArticles.length === 0) {
+            // If still no articles, we've really seen them all
+            toast({
+              title: "Notice",
+              description:
+                "You've seen all available articles. We'll reset your seen articles list.",
+            });
+
+            // Reset local tracking
+            setLocalSeenArticles([]);
+            setArticles(newSession.articles);
+          } else {
+            setArticles(newFilteredArticles);
+          }
+
+          setSessionId(newSession.id);
+        } else {
+          setArticles(filteredArticles);
+          setSessionId(gameSession.id);
+        }
+
+        setUserAnswers({});
+        setCurrentArticleIndex(0);
+        setLoading(false);
+      } catch (error) {
+        console.error("Error fetching articles:", error);
+        toast({
+          title: "Error",
+          description: "Failed to load articles",
+          variant: "destructive",
+        });
+        setLoading(false);
+      }
+    };
+
+    if (user) {
+      fetchArticles();
+    }
+  }, [user, localSeenArticles]);
 
   if (initialLoading) {
     return (
@@ -614,110 +745,142 @@ export default function PlayGame() {
           ) : gameOver ? (
             // Game over section
             <div className="container max-w-4xl mx-auto p-6 flex-1 flex flex-col items-center justify-center">
-              <div className="py-6">
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                  <div className="bg-blue-50 rounded-lg p-4 text-center">
-                    <div className="text-3xl font-bold text-blue-600">
-                      {score}
-                    </div>
-                    <div className="text-sm text-gray-600 mt-1">
-                      Total Score
-                    </div>
+              {articles.length === 0 ? (
+                // No articles available
+                <div className="text-center py-12 px-4">
+                  <div className="bg-amber-100 rounded-full p-4 mx-auto w-16 h-16 flex items-center justify-center mb-4">
+                    <AlertTriangle className="h-8 w-8 text-amber-600" />
                   </div>
-                  <div className="bg-green-50 rounded-lg p-4 text-center">
-                    <div className="text-3xl font-bold text-green-600">
-                      {articleStats.correct}
-                    </div>
-                    <div className="text-sm text-gray-600 mt-1">Correct</div>
-                  </div>
-                  <div className="bg-red-50 rounded-lg p-4 text-center">
-                    <div className="text-3xl font-bold text-red-600">
-                      {articleStats.incorrect}
-                    </div>
-                    <div className="text-sm text-gray-600 mt-1">Incorrect</div>
-                  </div>
-                  <div className="bg-yellow-50 rounded-lg p-4 text-center">
-                    <div className="text-3xl font-bold text-yellow-600">
-                      {articleStats.bestStreak}
-                    </div>
-                    <div className="text-sm text-gray-600 mt-1">
-                      Best Streak
-                    </div>
-                  </div>
+                  <h2 className="text-2xl font-bold text-gray-900 mb-2">
+                    No More Articles Available
+                  </h2>
+                  <p className="text-gray-600 mb-8 max-w-md mx-auto">
+                    You've seen all the available articles in our database.
+                    Please check back later for new content!
+                  </p>
+                  <Button
+                    type="button"
+                    onClick={restartGame}
+                    disabled={loading}
+                  >
+                    Check Again
+                  </Button>
                 </div>
+              ) : (
+                // Show stats and game summary
+                <>
+                  <div className="py-6">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="bg-blue-50 rounded-lg p-4 text-center">
+                        <div className="text-3xl font-bold text-blue-600">
+                          {score}
+                        </div>
+                        <div className="text-sm text-gray-600 mt-1">
+                          Total Score
+                        </div>
+                      </div>
+                      <div className="bg-green-50 rounded-lg p-4 text-center">
+                        <div className="text-3xl font-bold text-green-600">
+                          {articleStats.correct}
+                        </div>
+                        <div className="text-sm text-gray-600 mt-1">
+                          Correct
+                        </div>
+                      </div>
+                      <div className="bg-red-50 rounded-lg p-4 text-center">
+                        <div className="text-3xl font-bold text-red-600">
+                          {articleStats.incorrect}
+                        </div>
+                        <div className="text-sm text-gray-600 mt-1">
+                          Incorrect
+                        </div>
+                      </div>
+                      <div className="bg-yellow-50 rounded-lg p-4 text-center">
+                        <div className="text-3xl font-bold text-yellow-600">
+                          {articleStats.bestStreak}
+                        </div>
+                        <div className="text-sm text-gray-600 mt-1">
+                          Best Streak
+                        </div>
+                      </div>
+                    </div>
 
-                <div className="mt-6 bg-gray-50 rounded-lg p-4">
-                  <h4 className="font-medium text-gray-900 mb-3">
-                    Your Media Literacy Rating
-                  </h4>
-                  <div className="relative pt-1">
-                    <div className="flex mb-2 items-center justify-between">
-                      <div>
-                        <span className="text-xs font-semibold inline-block py-1 px-2 uppercase rounded-full text-blue-600 bg-blue-200">
-                          Skill Level
-                        </span>
+                    <div className="mt-6 bg-gray-50 rounded-lg p-4">
+                      <h4 className="font-medium text-gray-900 mb-3">
+                        Your Media Literacy Rating
+                      </h4>
+                      <div className="relative pt-1">
+                        <div className="flex mb-2 items-center justify-between">
+                          <div>
+                            <span className="text-xs font-semibold inline-block py-1 px-2 uppercase rounded-full text-blue-600 bg-blue-200">
+                              Skill Level
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-xs font-semibold inline-block text-blue-600">
+                              {articleStats.correct === 0
+                                ? 0
+                                : Math.round(
+                                    (articleStats.correct /
+                                      (articleStats.correct +
+                                        articleStats.incorrect)) *
+                                      100
+                                  )}
+                              %
+                            </span>
+                          </div>
+                        </div>
+                        <div className="overflow-hidden h-2 mb-4 text-xs flex rounded bg-blue-200">
+                          <div
+                            className="shadow-none flex flex-col text-center whitespace-nowrap text-white justify-center bg-blue-600"
+                            style={{
+                              width: `${
+                                articleStats.correct === 0
+                                  ? 0
+                                  : Math.round(
+                                      (articleStats.correct /
+                                        (articleStats.correct +
+                                          articleStats.incorrect)) *
+                                        100
+                                    )
+                              }%`,
+                            }}
+                          ></div>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-xs text-gray-500">
+                            Beginner
+                          </span>
+                          <span className="text-xs text-gray-500">
+                            Intermediate
+                          </span>
+                          <span className="text-xs text-gray-500">Expert</span>
+                        </div>
                       </div>
-                      <div className="text-right">
-                        <span className="text-xs font-semibold inline-block text-blue-600">
-                          {articleStats.correct === 0
-                            ? 0
-                            : Math.round(
-                                (articleStats.correct /
-                                  (articleStats.correct +
-                                    articleStats.incorrect)) *
-                                  100
-                              )}
-                          %
-                        </span>
-                      </div>
-                    </div>
-                    <div className="overflow-hidden h-2 mb-4 text-xs flex rounded bg-blue-200">
-                      <div
-                        className="shadow-none flex flex-col text-center whitespace-nowrap text-white justify-center bg-blue-600"
-                        style={{
-                          width: `${
-                            articleStats.correct === 0
-                              ? 0
-                              : Math.round(
-                                  (articleStats.correct /
-                                    (articleStats.correct +
-                                      articleStats.incorrect)) *
-                                    100
-                                )
-                          }%`,
-                        }}
-                      ></div>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-xs text-gray-500">Beginner</span>
-                      <span className="text-xs text-gray-500">
-                        Intermediate
-                      </span>
-                      <span className="text-xs text-gray-500">Expert</span>
                     </div>
                   </div>
-                </div>
-              </div>
 
-              <div className="mt-6 flex-1 flex items-center justify-center">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="flex-1 sm:flex-none"
-                  onClick={handleMoreArticles}
-                  disabled={loading}
-                >
-                  Load More Articles
-                </Button>
-                <Button
-                  type="button"
-                  className="flex-1 sm:flex-none"
-                  onClick={restartGame}
-                  disabled={loading}
-                >
-                  Start New Game
-                </Button>
-              </div>
+                  <div className="mt-6 flex-1 flex items-center justify-center">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="flex-1 sm:flex-none"
+                      onClick={handleMoreArticles}
+                      disabled={loading}
+                    >
+                      Load More Articles
+                    </Button>
+                    <Button
+                      type="button"
+                      className="flex-1 sm:flex-none"
+                      onClick={restartGame}
+                      disabled={loading}
+                    >
+                      Start New Game
+                    </Button>
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             // Main game area when playing
