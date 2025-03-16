@@ -50,6 +50,17 @@ export default function NewsManagement() {
   const [reason, setReason] = useState("");
   const [category, setCategory] = useState("general");
 
+  // Fake news types from the about page
+  const fakeNewsTypes = [
+    "False Claims",
+    "Misleading Headlines",
+    "Out of Context",
+    "Satire or Parody",
+    "Impersonation",
+    "Manipulated Content",
+    "Conspiracy Theory",
+  ];
+
   useEffect(() => {
     fetchArticles();
     fetchStats();
@@ -942,11 +953,18 @@ export default function NewsManagement() {
                     <label className="block text-sm font-medium mb-1">
                       Fake News Reason
                     </label>
-                    <Input
+                    <select
                       value={reason}
                       onChange={(e) => setReason(e.target.value)}
-                      placeholder="Explain why this is fake news"
-                    />
+                      className="w-full border rounded-md p-2"
+                    >
+                      <option value="">Select a reason</option>
+                      {fakeNewsTypes.map((type) => (
+                        <option key={type} value={type}>
+                          {type}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                 )}
 

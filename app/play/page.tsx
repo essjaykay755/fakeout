@@ -37,6 +37,7 @@ import {
   getGameSession,
   createGameSession,
   resetAllArticles,
+  SubmitAnswerResponse,
 } from "@/lib/supabase/functions";
 import {
   CheckCircle,
@@ -64,6 +65,7 @@ interface Article {
   is_fake: boolean;
   category: string;
   published_at: string;
+  reason?: string;
 }
 
 export default function PlayGame() {
@@ -81,7 +83,7 @@ export default function PlayGame() {
   const [feedbackData, setFeedbackData] = useState<{
     article_id: string;
     is_fake: boolean;
-    reason?: string;
+    reason?: string | null;
     explanation?: string;
     message: string;
   } | null>(null);
@@ -93,6 +95,9 @@ export default function PlayGame() {
   const [showStats, setShowStats] = useState(false);
   const [showExplanation, setShowExplanation] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showFakeNewsTypeSelector, setShowFakeNewsTypeSelector] =
+    useState(false);
+  const [pendingFakeNews, setPendingFakeNews] = useState(false);
   const [sessionHistory, setSessionHistory] = useState<
     {
       articleId: string;
@@ -168,6 +173,22 @@ export default function PlayGame() {
     },
   ];
 
+  // Add a new state for article transitions
+  const [isTransitioning, setIsTransitioning] = useState(false);
+
+  // Add an initial setup state to prevent article flashing at startup
+  const [isInitialSetup, setIsInitialSetup] = useState(true);
+
+  // Fake news types from the about page
+  const fakeNewsTypes = [
+    "False Claims",
+    "Misleading Headlines",
+    "Out of Context",
+    "Satire or Parody",
+    "Impersonation",
+    "Manipulated Content",
+  ];
+
   useEffect(() => {
     if (!user) {
       toast({
@@ -179,39 +200,89 @@ export default function PlayGame() {
       return;
     }
 
+    // Complete rewrite of the game initialization logic
     const loadSession = async () => {
-      setInitialLoading(true);
       try {
-        // Try to get an existing session
+        setInitialLoading(true);
+        setIsInitialSetup(true);
+
+        // First clear any existing articles to prevent flashing
+        setArticles([]);
+
+        // Get session data
         const sessionData = await getGameSession(user.id);
 
-        if (
-          sessionData &&
-          sessionData.articles &&
-          sessionData.articles.length > 0
-        ) {
-          setSessionId(sessionData.id);
-          setArticles(sessionData.articles);
-          setScore(sessionData.score || 0);
-
-          // If there are answers stored, restore the user's progress
-          if (
-            sessionData.answers &&
-            Object.keys(sessionData.answers).length > 0
-          ) {
-            setUserAnswers(sessionData.answers);
-            setCurrentArticleIndex(Object.keys(sessionData.answers).length);
-          }
-
-          updateStats(sessionData.articles, sessionData.answers || {});
-        } else {
-          // Create a new session with articles
-          const newSession = await createGameSession(user.id);
-          setSessionId(newSession.id);
-          setArticles(newSession.articles);
+        if (!sessionData) {
+          throw new Error("Failed to get game session");
         }
 
-        // Load previous session history
+        // Handle case where all articles have been seen
+        if (sessionData.message) {
+          setGameOver(true);
+          toast({
+            title: "Notice",
+            description: sessionData.message,
+          });
+          setInitialLoading(false);
+          setIsInitialSetup(false);
+          setLoading(false);
+          return;
+        }
+
+        // IMPORTANT: Set the current article index to 0 BEFORE setting articles
+        // This prevents the issue of multiple articles showing during initialization
+        setCurrentArticleIndex(0);
+
+        // Set session ID first
+        setSessionId(sessionData.id);
+
+        // Keep initial loading state active until we're completely ready
+        if (
+          sessionData.answers &&
+          Object.keys(sessionData.answers).length > 0
+        ) {
+          setUserAnswers(sessionData.answers);
+          updateStats(sessionData.articles, sessionData.answers);
+          setScore(sessionData.score || 0);
+
+          // Wait for all state updates to process before continuing
+          setTimeout(() => {
+            // Only after everything else is set, update the current index
+            setCurrentArticleIndex(Object.keys(sessionData.answers).length);
+
+            // Finally set the articles
+            setTimeout(() => {
+              setArticles(sessionData.articles);
+
+              // After a delay to ensure rendering is complete
+              setTimeout(() => {
+                setInitialLoading(false);
+                setIsInitialSetup(false);
+                setLoading(false);
+              }, 100);
+            }, 50);
+          }, 100);
+        } else {
+          // Start from the beginning - simpler case
+          setUserAnswers({});
+          setScore(0);
+          updateStats(sessionData.articles, {});
+
+          // Wait briefly to ensure all state is processed
+          setTimeout(() => {
+            // Then set articles
+            setArticles(sessionData.articles);
+
+            // After a delay to ensure rendering is complete
+            setTimeout(() => {
+              setInitialLoading(false);
+              setIsInitialSetup(false);
+              setLoading(false);
+            }, 100);
+          }, 100);
+        }
+
+        // Load session history in the background
         fetchSessionHistory();
       } catch (error) {
         console.error("Error loading game session:", error);
@@ -220,8 +291,9 @@ export default function PlayGame() {
           description: "Could not load game session. Please try again.",
           variant: "destructive",
         });
-      } finally {
         setInitialLoading(false);
+        setIsInitialSetup(false);
+        setLoading(false);
       }
     };
 
@@ -321,76 +393,245 @@ export default function PlayGame() {
     setArticleStats(stats);
   };
 
-  const handleSubmitAnswer = async (answer: boolean) => {
-    if (!sessionId || currentArticleIndex >= articles.length) return;
+  const handleSubmitAnswer = async (answer: boolean, fakeNewsType?: string) => {
+    // Debug log to help troubleshoot
+    console.log(
+      "handleSubmitAnswer called with answer:",
+      answer ? "Fake" : "Real",
+      fakeNewsType ? `and type: ${fakeNewsType}` : ""
+    );
+    console.log("Current state:", {
+      sessionId,
+      currentArticleIndex,
+      articlesLength: articles.length,
+      loading,
+      isTransitioning,
+    });
+
+    // Prevent multiple submissions while processing
+    if (
+      !sessionId ||
+      currentArticleIndex >= articles.length ||
+      loading ||
+      isTransitioning
+    ) {
+      console.log(
+        "Answer submission blocked - already processing or invalid state"
+      );
+      return;
+    }
+
+    // If the user selects "Fake News" and no type is provided, show the selector dialog
+    if (answer === true && !fakeNewsType) {
+      setPendingFakeNews(true);
+      setShowFakeNewsTypeSelector(true);
+      return;
+    }
 
     try {
       setLoading(true);
       const currentArticle = articles[currentArticleIndex];
 
-      // Store the user's answer
+      if (!currentArticle) {
+        console.error("No current article found at index", currentArticleIndex);
+        setLoading(false);
+        toast({
+          title: "Error",
+          description: "Could not find the current article. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      console.log("Current article:", {
+        id: currentArticle.id,
+        title: currentArticle.title,
+        is_fake: currentArticle.is_fake,
+      });
+
+      // Store the user's answer locally regardless of backend success
       const newAnswers = { ...userAnswers };
       newAnswers[currentArticle.id] = answer;
       setUserAnswers(newAnswers);
 
-      // Add to local tracking immediately
-      setLocalSeenArticles((prev) => [...prev, currentArticle.id]);
+      // Always provide feedback, even if backend fails
+      const isCorrect = answer === currentArticle.is_fake;
+      const localFeedback = {
+        article_id: currentArticle.id,
+        is_fake: currentArticle.is_fake,
+        reason: fakeNewsType,
+        explanation: isCorrect
+          ? "You correctly identified this article."
+          : "This was " + (currentArticle.is_fake ? "fake" : "real") + " news.",
+        message: isCorrect
+          ? "Good job! You correctly identified this article."
+          : "Sorry, that's not correct. Keep practicing!",
+      };
 
-      // Submit answer to backend
-      const result = await submitAnswer(
-        sessionId,
-        user?.id || "anonymous",
-        currentArticle.id,
-        answer,
-        selectedReason ? selectedReason : undefined
+      // Try to submit to backend
+      let backendSubmitSucceeded = false;
+
+      console.log(
+        `Submitting answer '${answer ? "Fake" : "Real"}' for article ${
+          currentArticle.id
+        }`
       );
 
-      // Update feedback data with null check
-      if (result && result.feedback) {
-        setFeedbackData(result.feedback);
+      try {
+        // Submit answer to backend with timeout protection
+        const submitPromise = submitAnswer(
+          sessionId,
+          user?.id || "anonymous",
+          currentArticle.id,
+          answer,
+          fakeNewsType ? fakeNewsType : undefined
+        );
 
-        // Show feedback
-        setShowFeedback(true);
+        // Create a timeout promise
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(
+            () => reject(new Error("Backend submission timed out")),
+            5000
+          );
+        });
 
-        // Update score and stats
-        if (result.feedback.is_fake === answer) {
-          // Correct answer
-          setScore(score + 10);
+        // Race the submit against the timeout
+        const result = (await Promise.race([
+          submitPromise,
+          timeoutPromise,
+        ])) as SubmitAnswerResponse;
+
+        console.log("Answer submission result:", result);
+
+        if (result.error) {
+          console.error("Error from submitAnswer:", result.error);
+          throw new Error(result.error.toString());
         }
-      } else {
+
+        // If we got feedback from backend, use it
+        if (result.feedback) {
+          setFeedbackData(result.feedback);
+          backendSubmitSucceeded = true;
+        }
+      } catch (backendError) {
+        console.error("Backend submission failed:", backendError);
+        // Fall back to local feedback if backend fails
+        backendSubmitSucceeded = false;
+      }
+
+      // If backend failed, use local feedback
+      if (!backendSubmitSucceeded) {
+        setFeedbackData(localFeedback);
         toast({
-          title: "Error",
-          description: result?.message || "Could not process your answer",
-          variant: "destructive",
+          title: "Connection Issue",
+          description:
+            "Saved your answer locally, but couldn't connect to the server.",
+          variant: "default",
         });
       }
 
-      // Update stats
+      // Always show feedback and update score
+      setShowFeedback(true);
+
+      // Update score based on correct identification
+      let pointsEarned = 0;
+      if (isCorrect) {
+        // Basic points for correct identification
+        pointsEarned = 10;
+
+        // If they correctly identified fake news, check if type is correct
+        if (answer && currentArticle.is_fake) {
+          // Get the actual reason from the article
+          const articleReason = currentArticle.reason || "";
+
+          // Check if the user selected the correct fake news type
+          if (fakeNewsType && articleReason.includes(fakeNewsType)) {
+            // Extra points for correct type
+            pointsEarned += 5;
+            toast({
+              title: "Bonus Points!",
+              description:
+                "You correctly identified the type of fake news (+5 points)",
+            });
+          }
+        }
+
+        setScore(score + pointsEarned);
+      }
+
+      // Update stats based on local data
       updateStats(articles, newAnswers);
+
+      // Check if this was the last article
+      if (currentArticleIndex >= articles.length - 1) {
+        console.log("Last article answered, setting game over");
+        setGameOver(true);
+        toast({
+          title: "Game Completed",
+          description: "You've completed all available articles!",
+        });
+      }
     } catch (error) {
-      console.error("Error submitting answer:", error);
+      console.error("Exception in handleSubmitAnswer:", error);
       toast({
         title: "Error",
-        description: "Failed to submit your answer",
+        description:
+          "An unexpected error occurred, but your answer was recorded locally.",
         variant: "destructive",
       });
     } finally {
       setLoading(false);
+      setSelectedReason(undefined); // Reset reason selection for next article
     }
   };
 
+  // Handle article transitions with improved control flow
   const handleNextArticle = () => {
+    // First set transitioning state to show loader instead of article content
+    setIsTransitioning(true);
+
+    // Close dialogs
     setShowFeedback(false);
     setShowExplanation(false);
 
+    // Get the current article ID that we just answered
+    const currentArticle = articles[currentArticleIndex];
+
+    // Track seen articles
+    if (currentArticle && !localSeenArticles.includes(currentArticle.id)) {
+      setLocalSeenArticles((prev) => [...prev, currentArticle.id]);
+    }
+
     // If we're at the end of available articles
     if (currentArticleIndex >= articles.length - 1) {
-      setGameOver(true);
+      console.log("Reached end of available articles, setting game over");
+
+      // First close the dialog properly, then set game over
+      setTimeout(() => {
+        setGameOver(true);
+        setIsTransitioning(false);
+
+        // Show message to user with current progress
+        toast({
+          title: "All Articles Completed",
+          description: `You've completed ${localSeenArticles.length} of ${totalExpectedArticles} articles. Use 'Reset Seen Articles' to play again.`,
+        });
+      }, 50);
+
       return;
     }
 
-    // Otherwise, move to the next article
-    setCurrentArticleIndex((prev) => prev + 1);
+    // Use a controlled, sequential update approach
+    // First clear article display with transition state, then update the index
+    setTimeout(() => {
+      // Move to the next article
+      setCurrentArticleIndex((prev) => prev + 1);
+
+      // Wait a bit more before showing the new article to ensure rendering is complete
+      setTimeout(() => {
+        setIsTransitioning(false);
+      }, 50);
+    }, 100);
   };
 
   // Add a function to initialize the database with sample data
@@ -408,7 +649,7 @@ export default function PlayGame() {
         // Reload the session to get the new articles
         if (user) {
           const sessionData = await createGameSession(user.id);
-          setSessionId(sessionData.id);
+          setSessionId(sessionData.id || null);
           setArticles(sessionData.articles);
           setCurrentArticleIndex(0);
           setUserAnswers({});
@@ -453,10 +694,6 @@ export default function PlayGame() {
         return;
       }
 
-      if (result.warning) {
-        console.warn("Warning during reset:", result.warning);
-      }
-
       // Clear local tracking too
       setLocalSeenArticles([]);
       toast({
@@ -492,7 +729,7 @@ export default function PlayGame() {
             `Loaded ${realCount} real and ${fakeCount} fake news articles`
           );
 
-          setSessionId(newSession.id);
+          setSessionId(newSession.id || null);
           setArticles(newSession.articles);
           setCurrentArticleIndex(0);
           setUserAnswers({});
@@ -526,6 +763,21 @@ export default function PlayGame() {
     }
   };
 
+  const handleFakeNewsTypeSelect = async (type: string) => {
+    setSelectedReason(type);
+    setShowFakeNewsTypeSelector(false);
+
+    if (pendingFakeNews) {
+      setPendingFakeNews(false);
+
+      // Increased delay to ensure the dialog is fully closed before proceeding
+      // This helps prevent race conditions with state updates
+      setTimeout(async () => {
+        await handleSubmitAnswer(true, type);
+      }, 200);
+    }
+  };
+
   const handleMoreArticles = async () => {
     if (!user || !sessionId) return;
 
@@ -550,31 +802,35 @@ export default function PlayGame() {
         console.error("Error checking seen articles:", debugErr);
       }
 
-      const result = await generateMoreArticles(sessionId, user.id);
+      // Type safety for the result
+      interface MoreArticlesResult {
+        success: boolean;
+        articles: Article[];
+        error?: string;
+        message?: string;
+      }
+
+      const result = (await generateMoreArticles(
+        sessionId,
+        user.id
+      )) as unknown as MoreArticlesResult;
 
       console.log("Result from generateMoreArticles:", result);
 
       if (result && result.articles && result.articles.length > 0) {
-        setArticles((prev) => [...prev, ...result.articles]);
+        setArticles((prev) => [...prev, ...(result.articles || [])]);
         setGameOver(false);
         toast({
           title: "New Articles",
           description: `Loaded ${result.articles.length} more articles successfully!`,
         });
-      } else if (result && result.success === false) {
-        // Handle explicit failure case
-        toast({
-          title: "No Articles",
-          description:
-            result.error || "No more articles available at the moment.",
-          variant: "destructive",
-        });
       } else {
-        // Handle empty result
+        // Safely handle result properties
+        const errorMessage = result?.error || "Could not load more articles";
+        console.error("Failed to generate more articles:", errorMessage);
         toast({
-          title: "No Articles",
-          description:
-            "No more articles available at the moment. Please check back later.",
+          title: "Error",
+          description: errorMessage,
           variant: "destructive",
         });
       }
@@ -612,6 +868,10 @@ export default function PlayGame() {
 
     setLoading(true);
     try {
+      // When restarting with a small database, reset local tracking
+      // This ensures we clear any locally tracked "seen" articles
+      setLocalSeenArticles([]);
+
       // Create a new session
       const newSession = await createGameSession(user.id);
 
@@ -628,7 +888,7 @@ export default function PlayGame() {
         });
       } else {
         // Reset all game state
-        setSessionId(newSession.id);
+        setSessionId(newSession.id || null);
         setArticles(newSession.articles);
         setCurrentArticleIndex(0);
         setUserAnswers({});
@@ -658,9 +918,15 @@ export default function PlayGame() {
 
   // Get the current article
   const currentArticle = articles[currentArticleIndex];
+
+  // Changed progress calculation to track the total articles seen (both local and from user answers)
+  // This ensures the progress shows correct percentage even when fewer than 10 articles are available
   const totalArticlesAnswered = Object.keys(userAnswers).length;
-  const progressPercentage =
-    articles.length > 0 ? (totalArticlesAnswered / articles.length) * 100 : 0;
+  const totalExpectedArticles = 10; // Total expected articles in a full game
+  const totalArticlesSeen = localSeenArticles.length;
+
+  // Calculate progress based on seen articles out of expected total (10)
+  const progressPercentage = (totalArticlesSeen / totalExpectedArticles) * 100;
 
   // Determine if answer was correct for feedback
   const wasCorrect = feedbackData
@@ -678,7 +944,7 @@ export default function PlayGame() {
     newArticles: ArticleType[],
     resetGame: boolean
   ) => {
-    setSessionId(newSessionId);
+    setSessionId(newSessionId || null);
     setArticles(newArticles);
     if (resetGame) {
       setCurrentArticleIndex(0);
@@ -687,144 +953,7 @@ export default function PlayGame() {
     }
   };
 
-  useEffect(() => {
-    const fetchArticles = async () => {
-      try {
-        setLoading(true);
-
-        // Check if Supabase is initialized before trying to use it
-        if (!supabase) {
-          console.error("Supabase client is not initialized");
-          toast({
-            title: "Database Error",
-            description:
-              "Database connection is not available. Please refresh the page.",
-            variant: "destructive",
-          });
-          setLoading(false);
-          return;
-        }
-
-        const gameSession = await getGameSession(user?.id || "anonymous");
-
-        if (!gameSession) {
-          console.error("Failed to get game session");
-          toast({
-            title: "Error",
-            description: "Could not start game session",
-            variant: "destructive",
-          });
-          setLoading(false);
-          return;
-        }
-
-        // If we have a message, it means we've seen all articles
-        if (gameSession.message) {
-          toast({
-            title: "Notice",
-            description: gameSession.message,
-          });
-          setArticles([]);
-          setLoading(false);
-          setGameOver(true);
-          return;
-        }
-
-        // Filter out any articles that we've already locally tracked as seen
-        const filteredArticles = gameSession.articles.filter(
-          (article) => !localSeenArticles.includes(article.id)
-        );
-
-        console.log(
-          "Original articles from server:",
-          gameSession.articles.length
-        );
-        console.log("After local filtering:", filteredArticles.length);
-
-        if (filteredArticles.length === 0 && gameSession.articles.length > 0) {
-          // If all articles were filtered out but we had articles from the server,
-          // there might be a sync issue - force a new session
-          console.log(
-            "All articles filtered out locally, creating new session"
-          );
-          const newSession = await createGameSession(user?.id || "anonymous");
-
-          // Check if new session has a message (all articles seen)
-          if (newSession.message) {
-            toast({
-              title: "Notice",
-              description: newSession.message,
-            });
-            setArticles([]);
-            setLoading(false);
-            setGameOver(true);
-            return;
-          }
-
-          // Filter the new session's articles too
-          const newFilteredArticles = newSession.articles.filter(
-            (article) => !localSeenArticles.includes(article.id)
-          );
-
-          if (newFilteredArticles.length === 0) {
-            // If still no articles, we've really seen them all
-            toast({
-              title: "Notice",
-              description:
-                "You've seen all available articles. We'll reset your seen articles list.",
-            });
-
-            // Reset local tracking
-            setLocalSeenArticles([]);
-            setArticles(newSession.articles);
-          } else {
-            setArticles(newFilteredArticles);
-          }
-
-          setSessionId(newSession.id);
-        } else {
-          setArticles(filteredArticles);
-          setSessionId(gameSession.id);
-        }
-
-        setUserAnswers({});
-        setCurrentArticleIndex(0);
-        setLoading(false);
-      } catch (error) {
-        console.error("Error fetching articles:", error);
-
-        // Check for specific error types to provide better user feedback
-        let errorMessage = "Failed to load articles";
-        if (error instanceof Error) {
-          errorMessage = error.message || errorMessage;
-          console.error("Error details:", error.stack);
-        }
-
-        toast({
-          title: "Error",
-          description: errorMessage,
-          variant: "destructive",
-        });
-
-        // Don't provide mock articles, show error state
-        setArticles([]);
-        setGameOver(true);
-        toast({
-          title: "No Articles Available",
-          description:
-            "Could not retrieve articles from the database. Please check again later when administrators have added content.",
-          variant: "destructive",
-        });
-        setLoading(false);
-      }
-    };
-
-    if (user) {
-      fetchArticles();
-    }
-  }, [user, localSeenArticles]);
-
-  if (initialLoading) {
+  if (initialLoading || isInitialSetup) {
     return (
       <div className="min-h-screen bg-gradient-to-b from-blue-50 to-white">
         <Header />
@@ -895,7 +1024,8 @@ export default function PlayGame() {
         <div className="mb-8">
           <div className="flex justify-between text-sm text-gray-600 mb-2">
             <span>
-              Article {currentArticleIndex + 1} of {articles.length}
+              {/* Update to show articles seen out of expected total */}
+              {totalArticlesSeen} of {totalExpectedArticles} Articles
             </span>
             <span>{progressPercentage.toFixed(0)}% Complete</span>
           </div>
@@ -904,7 +1034,7 @@ export default function PlayGame() {
 
         {/* Main Game Area */}
         <div className="flex-1 flex flex-col">
-          {initialLoading ? (
+          {initialLoading || isInitialSetup ? (
             <div className="flex-1 flex items-center justify-center">
               <div className="text-center">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-gray-900 mx-auto mb-4"></div>
@@ -919,8 +1049,20 @@ export default function PlayGame() {
                 </h2>
                 <p className="text-gray-600 text-center mb-6">
                   There are currently no more articles available to view.
-                  Articles are managed by administrators and will be added
-                  periodically. Please check back later.
+                  {totalArticlesSeen > 0 && (
+                    <span className="font-medium">
+                      {" "}
+                      You've seen {totalArticlesSeen} out of{" "}
+                      {totalExpectedArticles} total articles.
+                    </span>
+                  )}
+                  {totalArticlesSeen === 0 && (
+                    <span>
+                      {" "}
+                      Articles are managed by administrators and will be added
+                      periodically. Please check back later.
+                    </span>
+                  )}
                 </p>
                 <div className="flex flex-col gap-3 items-center">
                   <Button
@@ -946,9 +1088,6 @@ export default function PlayGame() {
               <div className="flex justify-between mb-6">
                 <div className="space-y-1">
                   <h1 className="text-2xl font-bold">Spot the Fake News</h1>
-                  <p className="text-gray-500">
-                    Article {currentArticleIndex + 1} of {articles.length}
-                  </p>
                 </div>
 
                 {/* Add History Button */}
@@ -975,7 +1114,7 @@ export default function PlayGame() {
                 </div>
               </div>
 
-              {currentArticle && (
+              {currentArticle && !isTransitioning ? (
                 <Card className="mb-6 border-0 shadow-lg">
                   <CardHeader className="bg-white rounded-t-lg border-b pb-3">
                     <div className="flex justify-between items-start">
@@ -1039,6 +1178,26 @@ export default function PlayGame() {
                           __html: currentArticle.content,
                         }}
                       />
+                      {/* Debug states */}
+                      <div className="mt-4 p-2 bg-gray-100 text-xs">
+                        <p>Debug - Loading: {loading ? "true" : "false"}</p>
+                        <p>
+                          Debug - Transitioning:{" "}
+                          {isTransitioning ? "true" : "false"}
+                        </p>
+                        <button
+                          onClick={() => {
+                            setLoading(false);
+                            setIsTransitioning(false);
+                            toast({
+                              description: "Reset loading states",
+                            });
+                          }}
+                          className="px-2 py-1 bg-blue-100 rounded mt-1"
+                        >
+                          Reset States
+                        </button>
+                      </div>
 
                       <div className="mt-6 pt-4 border-t border-gray-100 text-sm text-gray-600">
                         <p className="italic">
@@ -1068,8 +1227,13 @@ export default function PlayGame() {
                           variant="outline"
                           size="lg"
                           className="bg-white hover:bg-red-50 border-red-200 text-red-600 hover:text-red-700 hover:border-red-300 px-8"
-                          onClick={() => handleSubmitAnswer(true)}
-                          disabled={loading}
+                          onClick={() => {
+                            toast({
+                              description: "Submitting your answer...",
+                            });
+                            handleSubmitAnswer(true);
+                          }}
+                          disabled={loading || isTransitioning}
                         >
                           <ThumbsDown className="h-5 w-5 mr-2" />
                           Fake News
@@ -1079,52 +1243,29 @@ export default function PlayGame() {
                           variant="outline"
                           size="lg"
                           className="bg-white hover:bg-green-50 border-green-200 text-green-600 hover:text-green-700 hover:border-green-300 px-8"
-                          onClick={() => handleSubmitAnswer(false)}
-                          disabled={loading}
+                          onClick={() => {
+                            console.log("Real News button clicked");
+                            // Force immediate UI feedback even before backend response
+                            toast({
+                              title: "Processing",
+                              description: "Submitting your answer...",
+                            });
+                            handleSubmitAnswer(false);
+                          }}
+                          disabled={loading || isTransitioning}
                         >
                           <ThumbsUp className="h-5 w-5 mr-2" />
                           Real News
                         </Button>
                       </div>
                     </div>
-
-                    <div className="w-full">
-                      <h3 className="text-lg font-medium text-gray-900 mb-3">
-                        Why do you think so? (Optional)
-                      </h3>
-                      <RadioGroup
-                        value={selectedReason}
-                        onValueChange={setSelectedReason}
-                        className="grid grid-cols-1 md:grid-cols-2 gap-3"
-                      >
-                        {reasonOptions.map((option) => (
-                          <div
-                            key={option.value}
-                            className="flex items-start space-x-2 border border-gray-200 rounded-md p-3 hover:bg-gray-50"
-                          >
-                            <RadioGroupItem
-                              value={option.value}
-                              id={option.value}
-                              className="mt-1"
-                            />
-                            <Label
-                              htmlFor={option.value}
-                              className="flex-1 cursor-pointer"
-                            >
-                              <span className="font-medium text-gray-800">
-                                {option.label}
-                              </span>
-                              <p className="text-xs text-gray-500 mt-1">
-                                {option.description}
-                              </p>
-                            </Label>
-                          </div>
-                        ))}
-                      </RadioGroup>
-                    </div>
                   </CardFooter>
                 </Card>
-              )}
+              ) : isTransitioning ? (
+                <div className="flex justify-center items-center h-96">
+                  <div className="w-8 h-8 border-t-4 border-blue-600 border-solid rounded-full animate-spin"></div>
+                </div>
+              ) : null}
             </div>
           )}
         </div>
@@ -1419,6 +1560,49 @@ export default function PlayGame() {
             </Button>
             <Button onClick={() => setShowHistory(false)}>Close</Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Fake News Type Selector Dialog */}
+      <Dialog
+        open={showFakeNewsTypeSelector}
+        onOpenChange={(open) => {
+          if (!open) {
+            // Clear the state when dialog is closed directly
+            setShowFakeNewsTypeSelector(false);
+            setPendingFakeNews(false);
+            // Also ensure loading and transitioning states are reset if dialog is closed without selection
+            setLoading(false);
+            setIsTransitioning(false);
+            // No longer transitioning if dialog closed without selection
+            setIsTransitioning(false);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-xl text-red-600">
+              Select Fake News Type
+            </DialogTitle>
+            <DialogDescription>
+              What type of fake news do you think this is?
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            {fakeNewsTypes.map((type) => (
+              <Button
+                key={type}
+                variant="outline"
+                className="justify-start text-left hover:bg-red-50 hover:text-red-700 hover:border-red-300 border border-gray-200 p-4 rounded-md transition-all"
+                onClick={() => handleFakeNewsTypeSelect(type)}
+              >
+                <div className="flex items-center">
+                  <div className="h-2 w-2 bg-red-500 rounded-full mr-3"></div>
+                  <span className="font-medium">{type}</span>
+                </div>
+              </Button>
+            ))}
+          </div>
         </DialogContent>
       </Dialog>
 

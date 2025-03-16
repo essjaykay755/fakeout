@@ -1,0 +1,203 @@
+            console.log(
+              `Mock article ${articleId} already in user's seen_articles`
+            );
+          }
+        } else if (userError) {
+          console.error(
+            "Error fetching user data for mock article:",
+            userError
+          );
+
+          // If user doesn't exist, create them with this article as seen
+          if (userError.code === "PGRST116") {
+            const { error: createError } = await supabase.from("users").insert({
+              id: userId,
+              username: "Player",
+              email: "player@example.com",
+              points: isCorrect ? 10 : 0,
+              seen_articles: [articleId],
+            });
+
+            if (createError) {
+              console.error(
+                "Error creating user with mock seen_articles:",
+                createError
+              );
+            }
+          }
+        }
+      } catch (updateError) {
+        console.error(
+          "Error in updating seen_articles for mock article:",
+          updateError
+        );
+      }
+
+      return {
+        success: true,
+        feedback,
+      };
+    }
+  } catch (error) {
+    console.error("Error in submitAnswer:", error);
+    return {
+      success: false,
+      message: "Failed to submit answer",
+    };
+  }
+}
+
+// Generate more articles for the game
+export async function generateMoreArticles(sessionId: string, userId: string) {
+  console.log(`Generating more articles for session ${sessionId}`);
+
+  try {
+    // Verify Supabase client is initialized
+    if (!supabase) {
+      console.error("Supabase client is not initialized");
+      return {
+        success: false,
+        error: "Database connection not available",
+        articles: [],
+      };
+    }
+
+    // Test connection with a simple query first
+    try {
+      const { data: testData, error: testError } = await supabase
+        .from("news_articles")
+        .select("article_id")
+        .limit(1);
+
+      if (testError) {
+        console.error("Database connection test failed:", testError);
+        return {
+          success: false,
+          error: `Database connection test failed: ${JSON.stringify(
+            testError
+          )}`,
+          articles: [],
+        };
+      }
+
+      console.log("Database connection test successful");
+    } catch (connectionErr) {
+      console.error(
+        "Exception during database connection test:",
+        connectionErr
+      );
+      return {
+        success: false,
+        error: `Database connection exception: ${connectionErr}`,
+        articles: [],
+      };
+    }
+
+    // First check if there are any articles in the database
+    const { count: totalCount, error: countError } = await supabase
+      .from("news_articles")
+      .select("*", { count: "exact", head: true });
+
+    if (countError) {
+--
+    // Debug: Log what type of articles we got
+    if (randomArticles && randomArticles.length > 0) {
+      const realNewsCount = randomArticles.filter((a) => a.is_real).length;
+      const fakeNewsCount = randomArticles.filter((a) => !a.is_real).length;
+      console.log(
+        `Retrieved ${realNewsCount} real news and ${fakeNewsCount} fake news articles`
+      );
+    }
+
+    if (error) {
+      console.error("Error fetching articles:", error);
+      throw new Error(`Failed to fetch articles: ${JSON.stringify(error)}`);
+    }
+
+    if (!randomArticles || randomArticles.length === 0) {
+      console.error("No more unseen articles found for the user");
+      return {
+        success: false,
+        error: "No unseen articles available",
+        articles: [],
+      };
+    }
+
+    console.log(
+      `Found ${randomArticles.length} more unseen articles for the user:`,
+      randomArticles.map((a) => a.article_id)
+    );
+
+    // Convert database articles to ArticleType
+    const articles = randomArticles.map((article) => ({
+      id: article.article_id,
+      title: (article.title || "Untitled Article").replace(/^Fake:\s+/i, ""),
+      content: article.content || "",
+      author: article.author || "Unknown Author",
+      publisher: article.source || "Unknown Publisher",
+      url: article.url || "",
+      is_fake: !article.is_real, // Note the inversion - database uses is_real, we use is_fake
+      category: article.category || "Uncategorized",
+      published_at: article.created_at || new Date().toISOString(),
+    }));
+
+    console.log(
+      `Successfully prepared ${articles.length} more articles for the game session`
+    );
+
+    return {
+      success: true,
+      articles: articles,
+    };
+  } catch (error) {
+    console.error("Error in generateMoreArticles:", error);
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      articles: [],
+    };
+  }
+}
+
+// Helper function to generate mock articles (used as fallback)
+function getMockArticles(count = 5, fixed = false): ArticleType[] {
+  console.warn(
+    "Not returning mock articles as per user preference. Please ensure database has articles."
+  );
+
+  // Return empty array instead of mock articles
+  return [];
+}
+
+// Add this helper function to reset all seen articles
+export async function resetAllArticles(userId: string) {
+  console.log(`Resetting all seen articles for user: ${userId}`);
+
+  try {
+    // First verify the user exists
+    const { data: userData, error: userError } = await supabase
+      .from("users")
+      .select("id, seen_articles")
+      .eq("id", userId)
+      .single();
+
+    if (userError) {
+      console.error("Error finding user for reset:", userError);
+      if (userError.code === "PGRST116") {
+        // User not found, create a new user record with empty seen_articles
+        const { error: createError } = await supabase.from("users").insert({
+          id: userId,
+          username: "Player",
+          email: "player@example.com",
+          points: 0,
+          seen_articles: [],
+        });
+
+        if (createError) {
+          console.error("Error creating user record:", createError);
+          return { success: false, error: "Failed to create user record" };
+        }
+
+        console.log("Created new user with empty seen_articles");
+        return {
+          success: true,
