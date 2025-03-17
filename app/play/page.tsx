@@ -1009,14 +1009,6 @@ export default function PlayGame() {
                 {articleStats.incorrect}
               </span>
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowStats(true)}
-            >
-              <BarChart className="h-4 w-4 mr-1" />
-              Stats
-            </Button>
           </div>
         </div>
 
